@@ -1,0 +1,6 @@
+name = "telegraph-sec"
+main = "worker.js"
+compatibility_date = "2025-06-01"
+
+# SecWire security miner for Telegraph. Serves CVE_LOOKUP (/cve) from the public CIRCL and
+# NVD CVE APIs, keyless. No secrets, no bindings: deploy is just `wrangler deploy`.

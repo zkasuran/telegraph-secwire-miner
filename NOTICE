@@ -1,0 +1,28 @@
+This miner serves data from third parties. Their terms travel with it.
+
+Each block below names one upstream, what it provides, the licence it publishes under, and the
+exact credit line that licence requires. Every credit line marked required also travels in the
+`attribution` field of every answer this miner returns, not only in this file.
+
+## cve.circl.lu
+
+CVE records: description, CVSS, CWE, affected products.
+
+Licence: CC BY 4.0 for the CVE Program data underneath.
+
+Required credit line:
+
+    CVE data from CIRCL (cve.circl.lu) and the CVE Program, CC BY 4.0.
+
+## services.nvd.nist.gov
+
+Canonical CVSS scores and vectors.
+
+Licence: No SPDX id. NIST publications are not subject to copyright in the United States.
+
+In the provider's own words: The terms ask that "This product uses the NVD API but is not endorsed or certified by the NVD." appear prominently within the application.
+
+Required credit line:
+
+    This product uses the NVD API but is not endorsed or certified by the NVD.
+
