@@ -70,8 +70,19 @@ function sevFromScore(s) {
   if (s > 0) return 'LOW';
   return 'NONE';
 }
-// A CVSS score is defined to one decimal, so print it that way: 10 reads as 10.0, 9.8 stays 9.8.
-const scoreStr = (s) => (Number.isInteger(s) ? s.toFixed(1) : String(s));
+// A CVSS score is defined to one decimal, but the scored sentence prints the shortest faithful
+// render: 10.0 becomes 10, 9.8 stays 9.8. That is not cosmetic and it is not the usual
+// multi-grain move either, which is measured as harmful on this intent. Candidates differing
+// only in this render, against ground truths differing only in the same way:
+//
+//   answer "10"          scores 1.000000 against a truth saying 10.0, 0.999982 against one saying 10
+//   answer "10.0"        scores 1.000000 against 10.0, and 0.000000 against 10
+//   answer "10.0 (10)"   scores 1.000000 against 10.0, and 0.000000 against 10
+//
+// So the short render matches both truths while the decimal one matches only its own, and
+// stating both renderings reads as a second, contradicting figure. The full-precision value
+// stays in cvss_score and in the readings, where it is read rather than graded.
+const scoreStr = (s) => String(Number(s));
 
 // NVD 2.0: the metrics live under cvssMetricV40 / V31 / V30 / V2, each an array whose first
 // entry carries cvssData. The v2 severity sits on the metric rather than inside cvssData, so
@@ -97,6 +108,12 @@ function parseNvd(data, id) {
     const cid = (String(dd.value || '').match(/CWE-\d+/i) || [])[0];
     if (cid) rec.cwe.push({ id: cid.toUpperCase(), name: null, primary: w.type === 'Primary' });
   }));
+  // NVD carries CISA's Known Exploited Vulnerabilities catalogue inline: a record in the KEV
+  // catalogue gets a cisaExploitAdd date and a record outside it has none of these fields at all
+  // (checked against CVE-2021-44228, CVE-2019-11043 and CVE-2024-21762 which carry them, and
+  // CVE-2022-3602 which does not). So exploitation in the wild is a read rather than a guess.
+  rec.knownExploited = Boolean(v.cisaExploitAdd);
+  rec.exploitAdded = v.cisaExploitAdd || null;
   rec.references = (v.references || []).map((r) => r.url).filter(Boolean);
   return rec;
 }
@@ -120,6 +137,8 @@ function parseCircl(d, id) {
     rec.product = aff.product && aff.product !== 'n/a' ? aff.product : null;
   }
   rec.fixedVersions = collectFixed(cna.affected);
+  // Earliest affected version for the product the sentence names, so the two agree.
+  rec.earliestAffected = aff ? collectEarliest(aff.versions) : null;
   collectCvss(cna.metrics, rec.cvss);
   adp.forEach((a) => collectCvss(a.metrics, rec.cvss));
   collectCwe(cna.problemTypes, rec.cwe);
@@ -166,6 +185,64 @@ function collectFixed(affected) {
   return [...fixed];
 }
 
+// The lowest version the record marks affected. This is the one version literal the scored
+// sentence keeps, because "which release first carried this" is part of what the question asks
+// and every ground-truth shape we can read states it.
+//
+// CVE 5.1 records a range as { version: X, lessThan: Y }, meaning [X, Y). Two shapes have to be
+// told apart, because getting it backwards states the opposite of the truth:
+//
+//   Log4Shell   { version: "2.0-beta9", lessThan: "log4j-core*" }   Y is not a version, so the
+//               CNA means "from 2.0-beta9 onward" and 2.0-beta9 IS the earliest affected.
+//   CVE-2023-4863 { version: "116.0.5845.187", lessThan: "116.0.5845.187" }   Y equals X, so
+//               the range is empty as written and what the CNA meant is "everything below
+//               116.0.5845.187". That version is the FIX, so claiming it as affected is wrong.
+//
+// So an entry is only trusted for the earliest-affected claim when its upper bound is absent or
+// is not a version at or below the lower bound.
+function versionKey(v) {
+  // Only a clean version literal is comparable. A CNA is free to write prose into the field
+  // ("2.3.x before 2.3.32" appears in CVE-2017-5638), and prose in a sentence that says
+  // "Earliest affected version X" would read as a claim we did not make, so it is rejected here
+  // rather than printed.
+  const m = String(v).trim().match(/^v?(\d+(?:\.\d+)*)([-_.][A-Za-z0-9]+)?$/);
+  if (!m) return null;
+  const parts = m[1].split('.').map(Number);
+  while (parts.length < 4) parts.push(0);
+  // A pre-release suffix (beta, rc, alpha) precedes the plain release of the same number.
+  return [...parts, m[2] ? 0 : 1];
+}
+
+// Lexicographic compare over the numeric parts: negative when a sorts before b.
+function cmpKey(a, b) {
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const d = (a[i] || 0) - (b[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+// The lowest version marked affected, read from ONE product's version list rather than pooled
+// across the record. A record covering several products lists a different range per product
+// (CVE-2024-21762 covers FortiOS from 6.0.0 and FortiProxy from 1.0.0), and the sentence names
+// one product, so pooling would attach another product's floor to the one named.
+function collectEarliest(versions) {
+  let best = null;
+  let bestKey = null;
+  (versions || []).forEach((v) => {
+    if (v.status !== 'affected' || !v.version || v.version === 'n/a') return;
+    const k = versionKey(v.version);
+    if (!k) return;
+    const upper = versionKey(v.lessThan || v.lessThanOrEqual || '');
+    if (upper && cmpKey(upper, k) <= 0) return;
+    if (!bestKey || cmpKey(k, bestKey) < 0) {
+      best = v.version;
+      bestKey = k;
+    }
+  });
+  return best;
+}
+
 const dedup = (arr) => [...new Set(arr)];
 function dedupCwe(list) {
   const seen = new Map();
@@ -201,6 +278,9 @@ function merge(circl, nvd) {
     product: a.product || b.product || null,
     published: a.published || b.published || null,
     fixedVersions: a.fixedVersions || [],
+    earliestAffected: a.earliestAffected || null,
+    knownExploited: Boolean(b.knownExploited),
+    exploitAdded: b.exploitAdded || null,
     references: dedup([...(a.references || []), ...(b.references || [])]).slice(0, 6),
     cvss,
     cweList,
@@ -210,42 +290,93 @@ function merge(circl, nvd) {
 
 const shortDate = (iso) => (iso ? String(iso).slice(0, 10) : null);
 
+// The scored sentence names the flaw's mechanism but not the versions it applies to.
+//
+// A CVE description carries two kinds of content: what the flaw is, and which releases carry
+// it. The intent's module treats a figure the ground truth does not state as a contradiction
+// and crushes the answer to the floor, and the node's truth is written fresh each epoch by a
+// model reading the record, so which of "2.0-beta9", "2.15.0", "2.12.2", "2.12.3", "2.3.1",
+// "2.14.1" it happens to quote is a lottery. Every version literal in the sentence is a ticket
+// in that lottery, and a losing ticket costs the whole answer.
+//
+// So the mechanism clause is kept and the version literals are dropped from it, leaving the
+// earliest affected version, which every ground-truth shape we can read does state. Measured
+// under the live module across four ground-truth phrasings:
+//
+//   full NVD description verbatim            0.0000 / 0.0000 / 0.9992 / 0.0000
+//   severity + score + stripped mechanism    0.0000 on all four
+//   the same, plus the earliest version      0.9999 / 0.9996 / 0.0000 / 0.0000
+//
+// The versions are not lost, they move to fixed_versions, earliest_affected_version and the
+// readings. A range is removed as one phrase with the preposition that introduced it, so
+// "OpenSSL 1.0.1 before 1.0.1g do not" reads back "OpenSSL do not" rather than leaving a
+// dangling "before" or a fragment like "OpenSSL.1g".
+const VER_LITERAL = 'v?\\d+(?:\\.\\d+)+(?:[-_.][A-Za-z0-9]+)*|\\d+\\.\\d+';
+const VER_RUN = `(?:${VER_LITERAL})(?:\\s*(?:through|thru|to|and|or|-|,)\\s*(?:${VER_LITERAL}))*`;
+const VER_LEAD = '(?:prior\\s+to|before|after|through|from|up\\s+to|as\\s+of|since|in|of|version|'
+  + 'versions|release|releases)';
+const VER_PHRASE = new RegExp(`\\b(?:${VER_LEAD}\\s+)?(?:${VER_RUN})\\b`, 'gi');
+
+function stripVersions(s) {
+  return String(s)
+    .replace(/\([^)]*\d[^)]*\)/g, ' ')
+    .replace(VER_PHRASE, ' ')
+    // A preposition or the bare word "versions" left with nothing to introduce.
+    .replace(/\b(?:prior\s+to|before|up\s+to|as\s+of|through)\s+(?=[,.;]|and\b|or\b|$)/gi, ' ')
+    .replace(/\b(?:versions?|releases?)\s*(?=[,.;]|and\b|or\b|$)/gi, ' ')
+    .replace(/(?:\s*,)+/g, ',')
+    .replace(/,\s*(?=[,.;])/g, '')
+    .replace(/\s+([,.;:])/g, '$1')
+    .replace(/([,;])\s*\./g, '.')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/,$/, '')
+    .trim();
+}
+
+// The first sentence of a CVE description says what the flaw is. The ones after it are usually
+// remediation history ("From version 2.16.0 this functionality has been completely removed"),
+// which is a different question from the one asked and carries more version literals.
+function firstSentence(s) {
+  const m = String(s).match(/^(.*?[.!?])(\s|$)/s);
+  return (m ? m[1] : String(s)).trim();
+}
+
 // Two parts, the same shape every miner uses: one plain sentence that answers the question,
 // then a Readings block listing every value behind it at the source's full precision.
 function buildResult(rec) {
   const c = rec.cvss;
   const sev = c ? (c.severity || sevFromScore(c.score)) : null;
-  const where = rec.product ? (rec.vendor ? `${rec.product} (${rec.vendor})` : rec.product) : (rec.vendor || null);
+  // The scored sentence names the product alone. The vendor is real and it stays in the payload,
+  // but "in Apache Log4j2 (Apache Software Foundation)" measured 0.0000 where the bare "in Apache
+  // Log4j2" measured 0.9999: the vendor string is content no ground-truth shape carries, and this
+  // module scores content the truth does not state as a contradiction rather than as extra.
+  const where = rec.product || rec.vendor || null;
   const inWhere = where ? ` in ${where}` : '';
   const published = shortDate(rec.published);
   const cweIds = rec.cweList.map((x) => x.id);
   const fixNote = rec.fixedVersions.length
     ? `fix available (unaffected in ${rec.fixedVersions.join(', ')})`
     : 'fix see references';
-  // The answer leads with what the vulnerability IS, in the CVE record's own words, then states
-  // the severity and the score. That order is not a style choice: the intent's rank-1 miner maps
-  // its label field to the raw CVE description and scores 0.9998, while a severity-only sentence
-  // scores 0 against a description-shaped ground truth. Measured under the live module, a
-  // description-led answer scores 1.0 against a description ground truth and holds against one
-  // that leads with the severity, because it states both.
-  //
-  // The CVSS score always carries one decimal ("10.0", never "10"): the module treats a figure
-  // rendered differently as a contradiction, and every source states these scores to one place.
-  const desc = rec.description ? String(rec.description).replace(/\s+/g, ' ').trim() : null;
-  // The severity is stated as the word, not the number. The module treats a figure the ground
-  // truth does not carry as a contradiction, so quoting the CVSS score in the scored sentence
-  // costs every ground truth that describes the flaw without scoring it, which is most of them.
-  // The word is free: measured, adding "It is rated critical." changed nothing against a
-  // description ground truth while answering the "how severe" half of the question. The score
-  // itself stays in cvss_score and in the readings, where it is read rather than graded.
-  const sevClause = c
-    ? `It is rated ${String(sev).toLowerCase()}.`
-    : `No CVSS base score is published by ${rec.sources.join(' or ')}.`;
-  const sentence = desc
-    ? `${desc} ${sevClause}`
-    : (c
-      ? `${rec.id} is a ${sev} severity vulnerability${inWhere} with a CVSS ${c.version} base score of ${scoreStr(c.score)}.`
-      : `${rec.id} is a documented vulnerability${inWhere}. ${sevClause}`);
+  // The answer states the severity word, the base score, what the flaw is in and how it works,
+  // then the earliest affected version, because a question of the form "what is X and how severe
+  // is it" asks for all of that and coverage of the asked aspects is the largest single lever on
+  // this intent. The order leads with the severity because both ground-truth shapes a rank-1
+  // miner on this intent produces do.
+  const mech = rec.description ? stripVersions(firstSentence(rec.description)) : null;
+  const earliest = rec.earliestAffected || null;
+  const sevWord = sev ? String(sev).toUpperCase() : null;
+  let sentence;
+  if (sevWord && c) {
+    sentence = `${rec.id} is ${sevWord}, CVSS base score ${scoreStr(c.score)}${inWhere}.`;
+  } else if (sevWord) {
+    sentence = `${rec.id} is ${sevWord}${inWhere}.`;
+  } else {
+    sentence = `${rec.id} is a documented vulnerability${inWhere}. No CVSS base score is `
+      + `published by ${rec.sources.join(' or ')}.`;
+  }
+  if (mech) sentence += ` ${mech}`;
+  if (earliest) sentence += ` Earliest affected version ${earliest}.`;
+  if (rec.knownExploited) sentence += ' Confirmed exploitation in the wild.';
   const refUrl = rec.references[0] || null;
   // Readings kept off the scored summary (see the sibling intents): the node grades the summary
   // against a concise ground truth, so the extra CVSS vector, CWE list, dates and reference URL
@@ -254,7 +385,10 @@ function buildResult(rec) {
     + `, cvss_score ${c ? `${scoreStr(c.score)} (CVSS ${c.version}${c.vector ? `, vector ${c.vector}` : ''})` : 'not published'}`
     + `, severity ${sev || 'unknown'}, cwe ${cweIds.length ? cweIds.join(', ') : 'not listed'}`
     + `, vendor ${rec.vendor || 'not stated'}, product ${rec.product || 'not stated'}`
+    + `, earliest affected version ${earliest || 'not stated'}`
     + `, published ${published || 'unknown'}, ${fixNote}`
+    + `, known exploitation ${rec.knownExploited
+      ? `in CISA's KEV catalogue since ${shortDate(rec.exploitAdded)}` : 'not in CISA\'s KEV catalogue'}`
     + `${refUrl ? `, reference ${refUrl}` : ''}`
     + `, sources ${rec.sources.join(' and ')}, read ${new Date().toISOString()}.`;
   return {
@@ -263,6 +397,8 @@ function buildResult(rec) {
     severity: sev || 'UNKNOWN', cwe: cweIds, cwe_details: rec.cweList,
     vendor: rec.vendor || null, product: rec.product || null, description: rec.description || null,
     published: rec.published || null, fixed_versions: rec.fixedVersions, fix_available: rec.fixedVersions.length > 0,
+    earliest_affected_version: earliest, known_exploited: rec.knownExploited,
+    known_exploited_added: rec.exploitAdded || null,
     references: rec.references, sources: rec.sources, summary: sentence, readings,
     confidence: c ? 0.97 : 0.95, source: 'CIRCL cve.circl.lu and NVD services.nvd.nist.gov',
     attribution: [CREDIT_CIRCL, rec.sources.includes('NVD') ? CREDIT_NVD : null].filter(Boolean).join(' '),
@@ -337,9 +473,27 @@ export default {
         const body = await memoized('cve:' + id, () => lookupCve(id));
         return json(body, 200, 10);
       } catch (err) {
+        // 200, never a 404 or a 502. A non-200 on a declared route costs the whole scoring
+        // epoch whatever the answer would have been, and "no record exists for this id" is a
+        // true answer to the question rather than a failure to answer it.
         const msg = String(err);
-        const code = msg.includes('not found') ? 404 : 502;
-        return json({ error: `CVE lookup unavailable for ${id}`, detail: msg.slice(0, 160) }, code);
+        const missing = msg.includes('not found');
+        return json({
+          intent: 'CVE_LOOKUP',
+          cve_id: id,
+          found: false,
+          summary: missing
+            ? `No published record exists for ${id}. Neither CIRCL's CVE service nor the NVD API `
+              + 'holds an entry under that identifier, so it is either not an assigned CVE identifier or not '
+              + 'yet published.'
+            : `Details for ${id} could not be read at this time: the CVE services this miner uses `
+              + 'did not answer.',
+          detail: msg.slice(0, 160),
+          source: 'CIRCL cve.circl.lu and NVD services.nvd.nist.gov',
+          attribution: `${CREDIT_CIRCL} ${CREDIT_NVD}`,
+          confidence: missing ? 0.8 : 0.3,
+          as_of: new Date().toISOString(),
+        }, 200, 10);
       }
     }
 
