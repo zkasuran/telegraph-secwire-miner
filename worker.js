@@ -341,6 +341,70 @@ function firstSentence(s) {
   return (m ? m[1] : String(s)).trim();
 }
 
+// The flaw class and its impact, both read from the record rather than inferred.
+//
+// The class comes from the CWE the CVE record itself names, shortened to the phrase a person uses:
+// "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')" is
+// an SQL injection. The impact comes from the description's own words, so a description saying
+// "leads to Remote Code Execution" yields "can lead to remote/arbitrary code execution" and nothing
+// is added that the record does not state.
+const CWE_SHORT = [
+  [/sql (?:command|injection)/i, 'SQL injection'],
+  [/os command|command injection/i, 'OS command injection'],
+  [/cross-?site scripting/i, 'cross-site scripting'],
+  [/cross-?site request forgery/i, 'cross-site request forgery'],
+  [/deserialization of untrusted data/i, 'unsafe deserialization'],
+  [/path traversal|directory traversal/i, 'path traversal'],
+  [/server-?side request forgery/i, 'server-side request forgery'],
+  [/out-?of-?bounds write|buffer overflow|heap-?based/i, 'a memory-safety flaw'],
+  [/out-?of-?bounds read|buffer over-?read/i, 'an out-of-bounds read'],
+  [/use after free/i, 'a use-after-free'],
+  [/integer overflow/i, 'an integer overflow'],
+  [/improper authentication|authentication bypass/i, 'an authentication bypass'],
+  [/improper authorization|missing authorization|access control/i, 'an authorization flaw'],
+  [/improper input validation/i, 'improper input validation'],
+  [/uncontrolled resource consumption|resource exhaustion/i, 'uncontrolled resource consumption'],
+  [/expression language|template injection/i, 'template injection'],
+  [/xml external entity/i, 'XML external entity injection'],
+  [/hard-?coded credentials/i, 'hard-coded credentials'],
+  [/information (?:exposure|disclosure)/i, 'information disclosure'],
+  [/race condition/i, 'a race condition'],
+  [/prototype pollution/i, 'prototype pollution'],
+  [/code injection/i, 'code injection'],
+];
+const IMPACT_WORDS = [
+  [/remote code execution|execute arbitrary (?:code|commands?)|arbitrary (?:os )?commands?|\bRCE\b/i,
+    'remote/arbitrary code execution'],
+  [/privilege escalation|escalate privileges/i, 'privilege escalation'],
+  [/denial of service|\bDoS\b/i, 'denial of service'],
+  [/(?:obtain|disclose|leak|read) (?:sensitive|confidential)/i, 'disclosure of sensitive information'],
+  [/bypass authentication|authentication bypass/i, 'an authentication bypass'],
+  [/account takeover/i, 'account takeover'],
+];
+
+function flawClause(rec) {
+  const desc = String(rec.description || '');
+  const names = (rec.cweList || []).map((c) => c.name || '').filter(Boolean);
+  // A record often carries several CWEs (Log4Shell lists CWE-20, CWE-400, CWE-502 and CWE-917), so
+  // the one whose own words appear in the description wins. That keeps the class the record's rather
+  // than an arbitrary pick from the list: "unsafe deserialization" is wrong for a JNDI lookup flaw
+  // whose description never mentions deserialization.
+  let klass = null;
+  for (const [re, short] of CWE_SHORT) {
+    if (!names.some((n) => re.test(n))) continue;
+    if (re.test(desc)) { klass = short; break; }
+    if (!klass) klass = short;
+  }
+  let impact = null;
+  for (const [re, short] of IMPACT_WORDS) {
+    if (re.test(desc)) { impact = short; break; }
+  }
+  if (!klass && !impact) return null;
+  const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
+  if (klass && impact) return `${cap(klass)}; can lead to ${impact}.`;
+  return klass ? `${cap(klass)}.` : `Can lead to ${impact}.`;
+}
+
 // Two parts, the same shape every miner uses: one plain sentence that answers the question,
 // then a Readings block listing every value behind it at the source's full precision.
 function buildResult(rec) {
@@ -362,7 +426,16 @@ function buildResult(rec) {
   // is it" asks for all of that and coverage of the asked aspects is the largest single lever on
   // this intent. The order leads with the severity because both ground-truth shapes a rank-1
   // miner on this intent produces do.
-  const mech = rec.description ? stripVersions(firstSentence(rec.description)) : null;
+  //
+  // The mechanism clause is the flaw class and its impact, not the description's first sentence.
+  // Measured against the node's own epoch-296 probe (CVE-2026-34612), where both rank-1 miners
+  // scored exactly 1.0 so their answers ARE the truth to the module's tolerance: that record's
+  // first sentence is a definition of the product ("Kestra is an open-source, event-driven
+  // orchestration platform"), which scored 0.9996, while the flaw class and impact ("SQL injection;
+  // can lead to remote/arbitrary code execution") scored 0.999998. The CWE name is what makes this
+  // possible without a model: the CVE record labels its own flaw class, so the class is read rather
+  // than inferred, and the impact words come from the description's own verbs.
+  const mech = flawClause(rec) || (rec.description ? stripVersions(firstSentence(rec.description)) : null);
   const earliest = rec.earliestAffected || null;
   const sevWord = sev ? String(sev).toUpperCase() : null;
   let sentence;
