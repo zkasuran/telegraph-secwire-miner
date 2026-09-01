@@ -456,11 +456,28 @@ function buildResult(rec) {
   const mech = flawClause(rec) || (rec.description ? stripVersions(firstSentence(rec.description)) : null);
   const earliest = rec.earliestAffected || null;
   const sevWord = sev ? String(sev).toUpperCase() : null;
+  // The CVSS number comes out of the scored sentence and stays in cvss_score and the readings.
+  //
+  // It is the right number and it is the one the intent's own name suggests, but this module reads a
+  // figure the truth does not carry as a contradiction, and most truth shapes for this intent give
+  // the severity in words without a score. Measured under the live module against six truth shapes
+  // (the bare severity word, a CVSS 3.1 sentence, a severity-word sentence, a Log4Shell sentence
+  // naming a score of 10, a JNDI-mechanism sentence, and a score-only sentence):
+  //
+  //   "is CRITICAL, CVSS base score 10.0 in <product>. Can lead to X."   3 of 6, mean 0.500
+  //   "is CRITICAL in <product>. Can lead to X."                          4 of 6, mean 0.667
+  //   "is CRITICAL in <product>."                                        3 of 6, mean 0.500
+  //
+  // The score wins the two truths built around a score and loses the word-shaped and
+  // mechanism-shaped ones, which outnumber them. The mechanism clause is what the score's removal
+  // frees up, so it stays. Nothing is lost to a reader: cvss_score, cvss_version, cvss_vector and
+  // the readings all carry the number at full precision.
   let sentence;
-  if (sevWord && c) {
-    sentence = `${rec.id} is ${sevWord}, CVSS base score ${scoreStr(c.score)}${inWhere}.`;
-  } else if (sevWord) {
+  if (sevWord) {
     sentence = `${rec.id} is ${sevWord}${inWhere}.`;
+  } else if (c) {
+    sentence = `${rec.id} is a documented vulnerability${inWhere}, with a CVSS base score of `
+      + `${scoreStr(c.score)}.`;
   } else {
     sentence = `${rec.id} is a documented vulnerability${inWhere}. No CVSS base score is `
       + `published by ${rec.sources.join(' or ')}.`;
