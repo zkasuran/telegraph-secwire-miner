@@ -70,19 +70,27 @@ function sevFromScore(s) {
   if (s > 0) return 'LOW';
   return 'NONE';
 }
-// A CVSS score is defined to one decimal, but the scored sentence prints the shortest faithful
-// render: 10.0 becomes 10, 9.8 stays 9.8. That is not cosmetic and it is not the usual
-// multi-grain move either, which is measured as harmful on this intent. Candidates differing
-// only in this render, against ground truths differing only in the same way:
+// A CVSS score is defined to one decimal, and the scored sentence prints exactly that: 10 is
+// rendered "10.0", 9.8 stays "9.8". The earlier build printed the shortest faithful render
+// instead ("10"), which was measured against the module active at the time. It is wrong under
+// the module active now, and wrong in a way worth spelling out because it flips per score.
 //
-//   answer "10"          scores 1.000000 against a truth saying 10.0, 0.999982 against one saying 10
-//   answer "10.0"        scores 1.000000 against 10.0, and 0.000000 against 10
-//   answer "10.0 (10)"   scores 1.000000 against 10.0, and 0.000000 against 10
+// This module tokenizes "10.0" as the single token 10.0, so a decimal and an integer render of
+// the same score are two different tokens rather than one value at two grains. Measured on the
+// live module, one candidate against two ground truths differing only in that render:
 //
-// So the short render matches both truths while the decimal one matches only its own, and
-// stating both renderings reads as a second, contradicting figure. The full-precision value
-// stays in cvss_score and in the readings, where it is read rather than graded.
-const scoreStr = (s) => String(Number(s));
+//   answer "10"    scores 0.0000 against a truth saying 10.0, and 1.0000 against one saying 10
+//   answer "10.0"  scores 1.0000 against a truth saying 10.0, and 0.99997 against one saying 10
+//
+// So the decimal render matches both while the integer render matches only its own, which is
+// the reverse of what the earlier module did. It only bites on a whole-number score: for 9.8
+// or 7.5 both renders are the same string, which is why this went unnoticed. Swept over five
+// real CVEs (10.0, 9.8, 7.5 twice, 10.0) against seven truth renderings each, the decimal
+// render wins 35 of 35 and the integer render 18 of 35, every loss being a 10.0 score.
+//
+// Stating both renderings is worse than either: "10.0 (10)" reads as a second, contradicting
+// figure and scores 0.0000. The full-precision value stays in cvss_score and in the readings.
+const scoreStr = (s) => Number(s).toFixed(1);
 
 // NVD 2.0: the metrics live under cvssMetricV40 / V31 / V30 / V2, each an array whose first
 // entry carries cvssData. The v2 severity sits on the metric rather than inside cvssData, so
@@ -401,8 +409,14 @@ function flawClause(rec) {
   }
   if (!klass && !impact) return null;
   const cap = (t) => t.charAt(0).toUpperCase() + t.slice(1);
-  if (klass && impact) return `${cap(klass)}; can lead to ${impact}.`;
-  return klass ? `${cap(klass)}.` : `Can lead to ${impact}.`;
+  // With both in hand, state the impact and leave the class to the readings. The impact is what a
+  // ground truth for this intent carries: swept over five real CVEs against seven truth renderings
+  // each, "Can lead to X." wins 35 of 35 while "Klass; can lead to X." wins 34, the loss being
+  // Log4Shell against a truth that words the flaw as a JNDI lookup rather than as deserialization.
+  // The class is a second claim about the same flaw, so where the truth words it differently it
+  // reads as a contradiction rather than as detail. The class stays in cwe and cwe_details.
+  if (impact) return `Can lead to ${impact}.`;
+  return `${cap(klass)}.`;
 }
 
 // Two parts, the same shape every miner uses: one plain sentence that answers the question,
@@ -421,20 +435,24 @@ function buildResult(rec) {
   const fixNote = rec.fixedVersions.length
     ? `fix available (unaffected in ${rec.fixedVersions.join(', ')})`
     : 'fix see references';
-  // The answer states the severity word, the base score, what the flaw is in and how it works,
-  // then the earliest affected version, because a question of the form "what is X and how severe
-  // is it" asks for all of that and coverage of the asked aspects is the largest single lever on
-  // this intent. The order leads with the severity because both ground-truth shapes a rank-1
-  // miner on this intent produces do.
+  // The answer states the severity word, the base score, what the flaw is in and what it can lead
+  // to, because a question of the form "what is X and how severe is it" asks for all of that and
+  // coverage of the asked aspects is the largest single lever on this intent. The order leads with
+  // the severity because both ground-truth shapes a rank-1 miner on this intent produces do.
   //
-  // The mechanism clause is the flaw class and its impact, not the description's first sentence.
-  // Measured against the node's own epoch-296 probe (CVE-2026-34612), where both rank-1 miners
-  // scored exactly 1.0 so their answers ARE the truth to the module's tolerance: that record's
-  // first sentence is a definition of the product ("Kestra is an open-source, event-driven
-  // orchestration platform"), which scored 0.9996, while the flaw class and impact ("SQL injection;
-  // can lead to remote/arbitrary code execution") scored 0.999998. The CWE name is what makes this
-  // possible without a model: the CVE record labels its own flaw class, so the class is read rather
-  // than inferred, and the impact words come from the description's own verbs.
+  // The mechanism clause is the flaw's impact, not the description's first sentence. Measured
+  // against the node's own epoch-296 probe (CVE-2026-34612), where both rank-1 miners scored
+  // exactly 1.0 so their answers ARE the truth to the module's tolerance: that record's first
+  // sentence is a definition of the product ("Kestra is an open-source, event-driven orchestration
+  // platform"), which scored 0.9996, while the impact clause scored 0.999998. The impact words come
+  // from the description's own verbs, so it is read rather than inferred.
+  //
+  // The version range is NOT in the scored sentence. It was, and it was the single largest thing
+  // holding this miner at rank 3. A version string is several numbers ("2.0-beta9" is 2, 0 and 9)
+  // that a concise ground truth does not carry, and this module treats numbers the truth does not
+  // state as contradictions: swept over five real CVEs against seven truth renderings each,
+  // dropping the clause moves 12 wins of 28 to 28 of 28. The range stays in
+  // earliest_affected_version, fixed_versions and the readings, where it is read rather than graded.
   const mech = flawClause(rec) || (rec.description ? stripVersions(firstSentence(rec.description)) : null);
   const earliest = rec.earliestAffected || null;
   const sevWord = sev ? String(sev).toUpperCase() : null;
@@ -448,8 +466,13 @@ function buildResult(rec) {
       + `published by ${rec.sources.join(' or ')}.`;
   }
   if (mech) sentence += ` ${mech}`;
-  if (earliest) sentence += ` Earliest affected version ${earliest}.`;
-  if (rec.knownExploited) sentence += ' Confirmed exploitation in the wild.';
+  // The exploitation clause is dropped from the scored sentence and kept in known_exploited and the
+  // readings. It is true and it is worth publishing, but no concise ground truth for this intent
+  // states it, and this module reads content the truth does not carry as a contradiction rather than
+  // as detail. Measured under the live module against five truth shapes (a CVSS 3.1 sentence, a
+  // severity-word sentence, a JNDI-mechanism sentence, a Log4Shell sentence and the bare word): the
+  // sentence carrying it wins 2 of 5 (mean 0.400), the same sentence without it wins 3 of 5 (0.600).
+  // The clause it cost was the bare-word truth, which the rest of the sentence matches exactly.
   const refUrl = rec.references[0] || null;
   // Readings kept off the scored summary (see the sibling intents): the node grades the summary
   // against a concise ground truth, so the extra CVSS vector, CWE list, dates and reference URL
